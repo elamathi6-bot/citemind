@@ -68,6 +68,10 @@ def db():
                    created TEXT DEFAULT CURRENT_TIMESTAMP)""")
     con.execute("""CREATE TABLE IF NOT EXISTS mastery(username TEXT, topic TEXT, p_known REAL,
                    attempts INTEGER, correct INTEGER, PRIMARY KEY (username, topic))""")
+    con.execute("""CREATE TABLE IF NOT EXISTS asked(id INTEGER PRIMARY KEY AUTOINCREMENT,
+                   username TEXT, question TEXT)""")
+    con.execute("""CREATE TABLE IF NOT EXISTS topics(username TEXT, topic TEXT, prereqs TEXT,
+                   PRIMARY KEY (username, topic))""")
     return con
 
 
@@ -146,6 +150,51 @@ def record_answer(concept, correct):
                     (user, topic, bkt_update(p, correct), att + 1, cor + int(correct)))
 
 
+# ------------------------------------------------------------ course outline (topics and prerequisites)
+
+def get_topics():
+    rows = db().execute("SELECT topic, prereqs FROM topics WHERE username=?",
+                        (st.session_state.user,)).fetchall()
+    return [(t, json.loads(p)) for t, p in rows]
+
+
+def build_outline():
+    """One LLM pass over a sample of the uploaded material to get topics and their prerequisites."""
+    docs = col.get(include=["documents"])["documents"]
+    if not docs:
+        return "empty"
+    step = max(1, len(docs) // 40)
+    excerpts = "\n---\n".join(d[:600] for d in docs[::step][:40])
+    text, _m = generate(f"""These are excerpts from a course. Identify 6 to 12 major topics, in teaching order.
+For each topic list its prerequisites: names of OTHER topics from your own list that should be learned first.
+Use short lowercase topic names. Return ONLY a JSON list in this format:
+[{{"topic": "binary search trees", "prerequisites": ["recursion"]}}]
+
+EXCERPTS:
+{excerpts}""", json_mode=True)
+    if text is None:
+        return "busy"
+    try:
+        items = json.loads(re.sub(r"^```(?:json)?|```$", "", text.strip(), flags=re.MULTILINE).strip())
+        names = {str(t["topic"]).strip().lower() for t in items if t.get("topic")}
+        rows = []
+        for t in items:
+            name = str(t.get("topic", "")).strip().lower()
+            if not name:
+                continue
+            pre = [str(p).strip().lower() for p in t.get("prerequisites", [])]
+            pre = [p for p in pre if p in names and p != name]
+            rows.append((st.session_state.user, name, json.dumps(pre)))
+    except (json.JSONDecodeError, TypeError, AttributeError):
+        return "malformed"
+    if not rows:
+        return "malformed"
+    with db() as con:
+        con.execute("DELETE FROM topics WHERE username=?", (st.session_state.user,))
+        con.executemany("INSERT OR REPLACE INTO topics VALUES (?,?,?)", rows)
+    return "ok"
+
+
 # ------------------------------------------------------------ AI helpers
 
 @st.cache_resource
@@ -179,9 +228,9 @@ def build_context(hits):
     return "\n\n".join(f"[{i+1}] ({label(m)})\n{doc}" for i, (doc, m, _) in enumerate(hits))
 
 
-def generate(contents, json_mode=False):
+def generate(contents, json_mode=False, models=None):
     config = types.GenerateContentConfig(response_mime_type="application/json") if json_mode else None
-    for model_name in [MODEL] + FALLBACK_MODELS:
+    for model_name in (models or [MODEL] + FALLBACK_MODELS):
         for attempt in range(3):
             try:
                 resp = llm.models.generate_content(model=model_name, contents=contents, config=config)
@@ -331,19 +380,70 @@ def parse_quiz(text, num_sources):
     return good or None
 
 
+def past_questions(limit=50):
+    rows = db().execute("SELECT question FROM asked WHERE username=? ORDER BY id DESC LIMIT ?",
+                        (st.session_state.user, limit)).fetchall()
+    return [r[0] for r in rows]
+
+
+def remember_questions(questions):
+    with db() as con:
+        con.executemany("INSERT INTO asked(username, question) VALUES (?,?)",
+                        [(st.session_state.user, q["question"]) for q in questions])
+
+
+def is_repeat(question, others, threshold=0.85):
+    """True if the question is very similar to one already asked."""
+    if not others:
+        return False
+    vecs = embedder.encode(others + [question])
+    q, rest = vecs[-1], vecs[:-1]
+    sims = rest @ q / (np.linalg.norm(rest, axis=1) * np.linalg.norm(q))
+    return float(sims.max()) >= threshold
+
+
+def verify_quiz(questions, hits):
+    """Cross-model check: a different model answers blind; keep only questions where it agrees with the key."""
+    if not questions:
+        return [], False
+    blind = [{"id": i, "question": q["question"], "options": q["options"]} for i, q in enumerate(questions)]
+    text, _m = generate(f"""Answer each question using ONLY the sources below.
+Return ONLY a JSON list like [{{"id": 0, "answer": "B"}}], one entry per question.
+
+SOURCES:
+{build_context(hits)}
+
+QUESTIONS:
+{json.dumps(blind)}""", json_mode=True, models=FALLBACK_MODELS + [MODEL])
+    if text is None:
+        return questions, False
+    try:
+        data = json.loads(re.sub(r"^```(?:json)?|```$", "", text.strip(), flags=re.MULTILINE).strip())
+        agreed = {int(d["id"]) for d in data
+                  if str(d["answer"]).strip().upper()[:1] == questions[int(d["id"])]["answer"]}
+    except (json.JSONDecodeError, KeyError, TypeError, ValueError, IndexError):
+        return questions, False
+    return [q for i, q in enumerate(questions) if i in agreed], True
+
+
 def make_quiz(topic, n, difficulty):
     hits = retrieve(topic)
     if not hits or hits[0][2] > MAX_DISTANCE:
         return None, hits, "not_covered"
-    prompt = f"""You are a study tutor. Write {n} multiple-choice questions about "{topic}"
+    past = past_questions(50)
+    names = [t for t, _ in get_topics()]
+    concept_rule = (f'- "concept" must be exactly one of these course topics: {names}' if names else
+                    '- "concept" is a 2 to 4 word name for the specific idea the question tests.')
+    prompt = f"""You are a study tutor. Write {n + 2} multiple-choice questions about "{topic}"
 using ONLY the sources below. Do not use outside knowledge. Difficulty: {difficulty}.
 Rules:
 - Each question has exactly 4 options and exactly one correct answer.
 - Wrong options must be plausible but clearly wrong according to the sources.
 - Mix question types: facts, how a process or code works, and why something is done.
 - Do not ask two questions that test the same fact.
+- Do not repeat or closely paraphrase these earlier questions: {past[:15]}
 - "source" is the number [n] of the source that supports the correct answer.
-- "concept" is a 2 to 4 word name for the specific idea the question tests.
+{concept_rule}
 - Return ONLY a JSON list, no other text, in this format:
 [{{"question": "...", "options": ["...", "...", "...", "..."], "answer": "B", "explanation": "one or two sentences", "source": 3, "concept": "bst insertion"}}]
 
@@ -355,7 +455,20 @@ SOURCES:
             return None, hits, "busy"
         questions = parse_quiz(text, len(hits))
         if questions:
-            return questions, hits, "ok"
+            drafted = len(questions)
+            kept = []
+            for q in questions:
+                if not is_repeat(q["question"], past + [k["question"] for k in kept]):
+                    kept.append(q)
+            kept, checked = verify_quiz(kept, hits)
+            kept = kept[:n]
+            if kept:
+                remember_questions(kept)
+                note = (f"{len(kept)} of {drafted} drafted questions kept "
+                        f"(repeats removed; answer keys cross-checked by a second model)." if checked else
+                        f"{len(kept)} questions kept (repeats removed; answer keys could not be cross-checked this time).")
+                st.session_state["quiz_note"] = note
+                return kept, hits, "ok"
     return None, hits, "malformed"
 
 
@@ -425,8 +538,8 @@ with st.sidebar:
 
 hero("Upload your course material. Answers come only from it, with citations.")
 
-tab_up, tab_ask, tab_sum, tab_quiz, tab_prog, tab_saved = st.tabs(
-    ["📤 Upload", "💬 Ask", "📝 Summary", "🎯 Quiz", "📈 Progress", "⭐ Saved"]
+tab_up, tab_ask, tab_sum, tab_quiz, tab_map, tab_prog, tab_saved = st.tabs(
+    ["📤 Upload", "💬 Ask", "📝 Summary", "🎯 Quiz", "🗺️ Topics", "📈 Progress", "⭐ Saved"]
 )
 
 # ---- Upload
@@ -517,7 +630,8 @@ with tab_quiz:
             if status == "ok":
                 st.session_state.qid = st.session_state.get("qid", 0) + 1
                 st.session_state.quiz = {"questions": questions, "hits": hits, "done": False,
-                                         "topic": topic.strip()}
+                                         "topic": topic.strip(),
+                                         "note": st.session_state.get("quiz_note", "")}
             else:
                 st.session_state.pop("quiz", None)
                 st.warning({"not_covered": "This topic isn't covered in your course material.",
@@ -527,6 +641,8 @@ with tab_quiz:
     quiz = st.session_state.get("quiz")
     if quiz:
         questions, hits, qid = quiz["questions"], quiz["hits"], st.session_state.qid
+        if quiz.get("note"):
+            st.caption(quiz["note"])
         with st.form(f"quiz_form_{qid}"):
             for i, q in enumerate(questions):
                 st.markdown(f"**Q{i+1}. {q['question']}**")
