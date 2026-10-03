@@ -472,6 +472,51 @@ SOURCES:
     return None, hits, "malformed"
 
 
+def make_diagnostic(max_topics=8):
+    """One question per course topic from a single model call, to place a new student quickly."""
+    names = [t for t, _ in get_topics()][:max_topics]
+    if not names:
+        return None, [], "no_outline"
+    hits, seen = [], set()
+    for name in names:
+        for h in retrieve(name, k=2):
+            if h[0] not in seen:
+                seen.add(h[0])
+                hits.append(h)
+    if not hits:
+        return None, [], "not_covered"
+    past = past_questions(50)
+    prompt = f"""You are a study tutor. Write one multiple-choice question for each of these course topics: {names}.
+Use ONLY the sources below. Do not use outside knowledge. Difficulty: medium.
+Rules:
+- Each question has exactly 4 options and exactly one correct answer.
+- Wrong options must be plausible but clearly wrong according to the sources.
+- "concept" must be exactly the topic name the question belongs to.
+- "source" is the number [n] of the source that supports the correct answer.
+- Skip a topic if the sources do not cover it.
+- Do not repeat or closely paraphrase these earlier questions: {past[:15]}
+- Return ONLY a JSON list, no other text, in this format:
+[{{"question": "...", "options": ["...", "...", "...", "..."], "answer": "B", "explanation": "one or two sentences", "source": 3, "concept": "{names[0]}"}}]
+
+SOURCES:
+{build_context(hits)}"""
+    for _ in range(2):
+        text, _m = generate(prompt, json_mode=True)
+        if text is None:
+            return None, hits, "busy"
+        questions = parse_quiz(text, len(hits))
+        if questions:
+            kept, checked = verify_quiz(questions, hits)
+            if kept:
+                remember_questions(kept)
+                st.session_state["quiz_note"] = (
+                    f"Diagnostic: {len(kept)} questions across {len(names)} topics"
+                    + ("; answer keys cross-checked by a second model." if checked
+                       else "; answer keys could not be cross-checked this time."))
+                return kept, hits, "ok"
+    return None, hits, "malformed"
+
+
 def run_and_store(key, title, fn, *args):
     st.session_state[key] = (title, *fn(*args))
 
@@ -615,6 +660,26 @@ with tab_sum:
 
 # ---- Quiz
 with tab_quiz:
+    have_topics = bool(get_topics())
+    if not have_topics:
+        st.info("Tip: build the course outline in the Topics tab to unlock a diagnostic quiz "
+                "and topic-based mastery tracking.")
+    elif not get_mastery():
+        st.info("New here? Take the diagnostic quiz so the app can see where you stand.")
+    if have_topics and st.button("🧭 Diagnostic quiz (one question per topic)", disabled=col.count() == 0):
+        with st.spinner("Writing a question for each topic..."):
+            questions, hits, status = make_diagnostic()
+        if status == "ok":
+            st.session_state.qid = st.session_state.get("qid", 0) + 1
+            st.session_state.quiz = {"questions": questions, "hits": hits, "done": False,
+                                     "topic": "diagnostic",
+                                     "note": st.session_state.get("quiz_note", "")}
+        else:
+            st.session_state.pop("quiz", None)
+            st.warning({"no_outline": "Build the course outline first (Topics tab).",
+                        "not_covered": "Your material doesn't cover these topics.",
+                        "busy": "All models are busy right now. Try again in a few minutes.",
+                        "malformed": "Could not generate a valid diagnostic. Try again."}[status])
     with st.form("topic_form"):
         topic = st.text_input("Quiz topic", placeholder="binary search tree")
         c1, c2 = st.columns(2)
@@ -652,25 +717,76 @@ with tab_quiz:
                 quiz["done"] = True
         if quiz["done"]:
             first_time = not quiz.get("recorded")  # record mastery only once per quiz
-            score, lines = 0, []
+            score, lines, results = 0, [], []
             for i, q in enumerate(questions):
                 picked = st.session_state.get(f"q{qid}_{i}")
                 ok = bool(picked) and picked[0] == q["answer"]
                 score += ok
+                results.append((q, ok))
                 if first_time and picked:
                     record_answer(q.get("concept") or quiz["topic"], ok)
                 src = f" (Source: {label(hits[q['source'] - 1][1])})" if q["source"] else ""
                 lines.append(f"Q{i+1}. {q['question']}\nCorrect answer: {q['answer']}. "
                              f"You chose: {picked[0] if picked else 'none'}.\n{q['explanation']}{src}\n")
                 with st.expander(f"{'✅' if ok else '❌'} Q{i+1}: correct answer {q['answer']}"):
+                    if picked and not ok:
+                        st.write(f"You chose: {picked}")
                     st.write(q["explanation"])
                     if src:
                         st.caption(src.strip(" ()"))
             quiz["recorded"] = True
             st.success(f"Score: {score}/{len(questions)}")
+            by_topic = {}
+            for q, ok in results:
+                name = q.get("concept") or quiz["topic"]
+                right, total = by_topic.get(name, (0, 0))
+                by_topic[name] = (right + int(ok), total + 1)
+            st.subheader("Report")
+            for name, (right, total) in by_topic.items():
+                st.write(f"{'✅' if right == total else '⚠️'} **{name}**: {right}/{total} correct")
+            wrong = [q for q, ok in results if not ok]
+            if wrong:
+                spots = sorted({label(hits[q["source"] - 1][1]) for q in wrong if q["source"]})
+                if spots:
+                    st.info("Review these parts of your material: " + "; ".join(spots))
             st.button("💾 Save quiz and results", key=f"save_quiz_{qid}", on_click=save_item,
                       args=("Quiz", f"Quiz: {quiz['topic']} ({score}/{len(questions)})",
                             f"Score: {score}/{len(questions)}\n\n" + "\n".join(lines)))
+
+# ---- Topics
+with tab_map:
+    if st.button("Build / refresh course outline", disabled=col.count() == 0):
+        with st.spinner("Reading your material and finding topics..."):
+            res = build_outline()
+        if res != "ok":
+            st.warning({"empty": "Upload some material first.",
+                        "busy": "All models are busy right now. Try again in a few minutes.",
+                        "malformed": "Could not build a valid outline. Try again."}[res])
+    topics = get_topics()
+    if not topics:
+        st.info("Upload your material, then build the course outline. Quiz questions will be tagged "
+                "with these topics so your mastery builds up per topic.")
+    else:
+        mastery = {t: p for t, p, _, _ in get_mastery()}
+
+        def node_colour(t):
+            p = mastery.get(t)
+            if p is None:
+                return "#DFE6E9"
+            return "#55EFC4" if p >= 0.7 else "#FFEAA7" if p >= 0.4 else "#FAB1A0"
+
+        def q(s):
+            return s.replace('"', "'")
+
+        dot = 'digraph { rankdir=LR; node [shape=box, style="rounded,filled", fontname=Helvetica];'
+        for t, pre in topics:
+            dot += f' "{q(t)}" [fillcolor="{node_colour(t)}"];'
+            for p in pre:
+                dot += f' "{q(p)}" -> "{q(t)}";'
+        dot += " }"
+        st.graphviz_chart(dot)
+        st.caption("Arrows point from a prerequisite to the topic that builds on it. "
+                   "Green: mastered, yellow: in progress, red: weak, grey: not tested yet.")
 
 # ---- Progress
 with tab_prog:
