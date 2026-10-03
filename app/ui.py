@@ -1,4 +1,5 @@
 import os, re, json, time, hashlib, secrets, sqlite3, tempfile
+import numpy as np
 import chromadb
 import streamlit as st
 from dotenv import load_dotenv
@@ -65,6 +66,8 @@ def db():
     con.execute("""CREATE TABLE IF NOT EXISTS saved(id INTEGER PRIMARY KEY AUTOINCREMENT,
                    username TEXT, kind TEXT, title TEXT, content TEXT,
                    created TEXT DEFAULT CURRENT_TIMESTAMP)""")
+    con.execute("""CREATE TABLE IF NOT EXISTS mastery(username TEXT, topic TEXT, p_known REAL,
+                   attempts INTEGER, correct INTEGER, PRIMARY KEY (username, topic))""")
     return con
 
 
@@ -98,6 +101,49 @@ def save_item(kind, title, content):
         con.execute("INSERT INTO saved(username, kind, title, content) VALUES (?,?,?,?)",
                     (st.session_state.user, kind, title, content))
     st.toast("Saved to your library ✅")
+
+
+# ------------------------------------------------------------ learner model (Bayesian knowledge tracing)
+
+# Hand-set defaults, not fitted to data. State this honestly in the documentation.
+P_INIT, P_TRANSIT, P_SLIP, P_GUESS = 0.30, 0.15, 0.10, 0.25
+
+
+def bkt_update(p, correct):
+    if correct:
+        post = p * (1 - P_SLIP) / (p * (1 - P_SLIP) + (1 - p) * P_GUESS)
+    else:
+        post = p * P_SLIP / (p * P_SLIP + (1 - p) * (1 - P_GUESS))
+    return post + (1 - post) * P_TRANSIT
+
+
+def get_mastery():
+    return db().execute("SELECT topic, p_known, attempts, correct FROM mastery "
+                        "WHERE username=? ORDER BY p_known", (st.session_state.user,)).fetchall()
+
+
+def canonical_concept(name):
+    """Merge near-duplicate concept names so mastery isn't split across them."""
+    name = name.strip().lower()
+    existing = [r[0] for r in get_mastery()]
+    if not existing:
+        return name
+    vecs = embedder.encode(existing + [name])
+    q, rest = vecs[-1], vecs[:-1]
+    sims = rest @ q / (np.linalg.norm(rest, axis=1) * np.linalg.norm(q))
+    i = int(sims.argmax())
+    return existing[i] if sims[i] >= 0.8 else name
+
+
+def record_answer(concept, correct):
+    topic = canonical_concept(concept)
+    user = st.session_state.user
+    with db() as con:
+        row = con.execute("SELECT p_known, attempts, correct FROM mastery WHERE username=? AND topic=?",
+                          (user, topic)).fetchone()
+        p, att, cor = row if row else (P_INIT, 0, 0)
+        con.execute("INSERT OR REPLACE INTO mastery VALUES (?,?,?,?,?)",
+                    (user, topic, bkt_update(p, correct), att + 1, cor + int(correct)))
 
 
 # ------------------------------------------------------------ AI helpers
@@ -278,6 +324,7 @@ def parse_quiz(text, num_sources):
                 src = int(q.get("source", 0))
                 good.append({"question": q["question"], "options": q["options"], "answer": ans,
                              "explanation": q["explanation"],
+                             "concept": str(q.get("concept") or "").strip() or None,
                              "source": src if 1 <= src <= num_sources else None})
         except (KeyError, TypeError, ValueError):
             continue
@@ -296,8 +343,9 @@ Rules:
 - Mix question types: facts, how a process or code works, and why something is done.
 - Do not ask two questions that test the same fact.
 - "source" is the number [n] of the source that supports the correct answer.
+- "concept" is a 2 to 4 word name for the specific idea the question tests.
 - Return ONLY a JSON list, no other text, in this format:
-[{{"question": "...", "options": ["...", "...", "...", "..."], "answer": "B", "explanation": "one or two sentences", "source": 3}}]
+[{{"question": "...", "options": ["...", "...", "...", "..."], "answer": "B", "explanation": "one or two sentences", "source": 3, "concept": "bst insertion"}}]
 
 SOURCES:
 {build_context(hits)}"""
@@ -377,8 +425,8 @@ with st.sidebar:
 
 hero("Upload your course material. Answers come only from it, with citations.")
 
-tab_up, tab_ask, tab_sum, tab_quiz, tab_saved = st.tabs(
-    ["📤 Upload", "💬 Ask", "📝 Summary", "🎯 Quiz", "⭐ Saved"]
+tab_up, tab_ask, tab_sum, tab_quiz, tab_prog, tab_saved = st.tabs(
+    ["📤 Upload", "💬 Ask", "📝 Summary", "🎯 Quiz", "📈 Progress", "⭐ Saved"]
 )
 
 # ---- Upload
@@ -487,11 +535,14 @@ with tab_quiz:
             if st.form_submit_button("Submit answers"):
                 quiz["done"] = True
         if quiz["done"]:
+            first_time = not quiz.get("recorded")  # record mastery only once per quiz
             score, lines = 0, []
             for i, q in enumerate(questions):
                 picked = st.session_state.get(f"q{qid}_{i}")
                 ok = bool(picked) and picked[0] == q["answer"]
                 score += ok
+                if first_time and picked:
+                    record_answer(q.get("concept") or quiz["topic"], ok)
                 src = f" (Source: {label(hits[q['source'] - 1][1])})" if q["source"] else ""
                 lines.append(f"Q{i+1}. {q['question']}\nCorrect answer: {q['answer']}. "
                              f"You chose: {picked[0] if picked else 'none'}.\n{q['explanation']}{src}\n")
@@ -499,10 +550,27 @@ with tab_quiz:
                     st.write(q["explanation"])
                     if src:
                         st.caption(src.strip(" ()"))
+            quiz["recorded"] = True
             st.success(f"Score: {score}/{len(questions)}")
             st.button("💾 Save quiz and results", key=f"save_quiz_{qid}", on_click=save_item,
                       args=("Quiz", f"Quiz: {quiz['topic']} ({score}/{len(questions)})",
                             f"Score: {score}/{len(questions)}\n\n" + "\n".join(lines)))
+
+# ---- Progress
+with tab_prog:
+    rows = get_mastery()
+    if not rows:
+        st.info("Take a quiz to start building your mastery profile.")
+    else:
+        import pandas as pd
+        df = pd.DataFrame(rows, columns=["Concept", "Mastery", "Attempts", "Correct"]).set_index("Concept")
+        st.bar_chart(df["Mastery"])
+        weak = [r for r in rows if r[1] < 0.6]
+        if weak:
+            st.warning("Weak concepts: " + ", ".join(r[0] for r in weak[:5]))
+        shown = df.copy()
+        shown["Mastery"] = (shown["Mastery"] * 100).round().astype(int).astype(str) + "%"
+        st.dataframe(shown)
 
 # ---- Saved
 with tab_saved:
