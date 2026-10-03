@@ -1,25 +1,14 @@
 ﻿streamlit
-google-generativeai
-faiss-cpu
+python-dotenv
 numpy
 pandas
-scikit-learn
-pdfplumber
-pypdfium2
-pillow
-python-dotenv
-requests
-bcrypt
-networkx
-matplotlib
-chromadb
 google-genai
+chromadb
+pypdf
+pymupdf
+python-pptx
+faster-whisper
 
-# CPU-only torch keeps the install small (needed only for sentence-transformers)
 --extra-index-url https://download.pytorch.org/whl/cpu
 torch
 sentence-transformers
-
-# Uncomment only if the code imports them:
-# opencv-python-headless
-# openpyxl
