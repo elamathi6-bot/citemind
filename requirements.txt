@@ -12,6 +12,8 @@ requests
 bcrypt
 networkx
 matplotlib
+chromadb
+google-genai
 
 # CPU-only torch keeps the install small (needed only for sentence-transformers)
 --extra-index-url https://download.pytorch.org/whl/cpu
